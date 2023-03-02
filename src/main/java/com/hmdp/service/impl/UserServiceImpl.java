@@ -2,6 +2,7 @@ package com.hmdp.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.bean.copier.CopyOptions;
+import cn.hutool.core.date.DateTime;
 import cn.hutool.core.lang.UUID;
 import cn.hutool.core.util.RandomUtil;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
@@ -12,14 +13,19 @@ import com.hmdp.entity.User;
 import com.hmdp.mapper.UserMapper;
 import com.hmdp.service.IUserService;
 import com.hmdp.utils.RegexUtils;
+import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.connection.BitFieldSubCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpSession;
 
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -54,7 +60,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         // 4.保存验证码到session
         //session.setAttribute("code", code);
         // 4.保存验证码到redis // set key value ex 120
-        stringRedisTemplate.opsForValue().set(LOGIN_CODE_KEY+phone, code, LOGIN_CODE_TTL , TimeUnit.MINUTES);
+        stringRedisTemplate.opsForValue().set(LOGIN_CODE_KEY+phone, code, LOGIN_CODE_TTL+3 , TimeUnit.MINUTES);
 
         // 5.发送验证码
         log.debug("发送短信验证码成功, 验证码: {}", code); // 这里如果不使用日志进行记录的话 就需要调用第三方的服务通过短信发送给用户验证码
@@ -115,7 +121,8 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         // 7.4.设置token有效期
         stringRedisTemplate.expire(tokenKey, LOGIN_USER_TTL, TimeUnit.SECONDS);
 
-        //8.返回token
+        //8.返回token 交给客户端使得以后客户端的每一次请求都携带该信息
+        // 这里是通过前端存储到session中的 并在每一次发送请求的时候 从session中将该数据取出来
         return Result.ok(token);
     }
 
@@ -127,5 +134,64 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         // 2.保存用户
         save(user);
         return null;
+    }
+
+    @Override
+    public Result sign() {
+        // 1.获取当前登录用户
+        Long userId = UserHolder.getUser().getId();
+        // 2.获取日期
+        LocalDateTime now = LocalDateTime.now();
+        // 3.拼接key
+        String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+        String key = USER_SIGN_KEY + userId + keySuffix;
+        // 4.获取今天是本月的第几天
+        int dayOfMonth = now.getDayOfMonth();
+        // 5.写入redis SETBIT key offset 1
+        stringRedisTemplate.opsForValue().setBit(key, dayOfMonth - 1, true);
+        return Result.ok();
+    }
+
+    @Override
+    public Result signCount() {
+        // 获取本月截至今天为止的所有签到记录
+        // 1.获取当前登录用户
+        Long userId = UserHolder.getUser().getId();
+        // 2.获取日期
+        LocalDateTime now = LocalDateTime.now();
+        // 3.拼接key
+        String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+        String key = USER_SIGN_KEY + userId + keySuffix;
+        // 4.获取今天是本月的第几天
+        int datOfMonth = now.getDayOfMonth();
+        // 5.获取本月截至今天为止的所有的签到记录，返回的是一个十进制数字 BITFIELD sign:202203 GET u14 0
+        List<Long> result = stringRedisTemplate.opsForValue().bitField(
+                key,
+                BitFieldSubCommands.create()
+                        .get(BitFieldSubCommands.BitFieldType.unsigned(datOfMonth)).valueAt(0));
+        if(result ==null || result.isEmpty()){
+            // 没有任何签到结果
+            return Result.ok(0);
+        }
+        Long num = result.get(0);
+        if(num==null ||num==0){
+            return Result.ok(0);
+        }
+        // 6.循环遍历
+        int count = 0;
+        while (true){
+            // 6.1.让这个数字与1做与运算，得到数字的最后一个Bit位  // 判断这个bit位是否为0
+            if((num&1)==0){
+                // 如果为0,说明未签到，结束
+                break;
+            }else{
+                // 如果不为0，说明已签到，计数器+1
+                count++;
+            }
+        }
+
+        // 把数字右移一位，抛弃最后一个Bit位
+        num >>>=1;
+        return Result.ok(count);
     }
 }
